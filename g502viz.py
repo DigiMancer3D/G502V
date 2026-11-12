@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import tkinter as tk
-from tkinter import PhotoImage, Menu, Toplevel, Label, Button, StringVar, messagebox, scrolledtext, colorchooser, Frame
+from tkinter import PhotoImage, Menu, Toplevel, Label, Button, StringVar, messagebox, scrolledtext, colorchooser, Frame, filedialog
 from pynput import keyboard, mouse
 import threading
 from pathlib import Path
@@ -8,6 +8,10 @@ import time
 import json
 import subprocess
 import math
+
+from input_remapper_auto import InputRemapperAutoMapper
+from evdev_global_input import EvdevGlobalInput
+from motion_direction import MotionFrameAccumulator
 
 def run_command(cmd, timeout=8):
     try:
@@ -19,7 +23,7 @@ def run_command(cmd, timeout=8):
 class G502Visualizer:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("G502 Visualizer")
+        self.root.title("G502 Visualizer — Profile-Independent Telemetry")
         self.root.geometry("1000x720")
         self.root.configure(bg="#1e1e1e")
         self.root.attributes("-topmost", True)
@@ -34,7 +38,8 @@ class G502Visualizer:
         self.canvas = tk.Canvas(self.root, width=950, height=480, bg="#1e1e1e", highlightthickness=0)
         self.canvas.pack(pady=8)
 
-        # Yaw settings (will be overwritten by load_settings)
+        # 2D movement-direction settings. Legacy yaw_* setting names are preserved
+        # on disk for backward compatibility with existing G502V settings.
         self.yaw_visible = True
         self.yaw_center_x = 720
         self.yaw_center_y = 310
@@ -43,6 +48,12 @@ class G502Visualizer:
         self.yaw_ring_visible = True
         self.yaw_dot_visible = True
         self.yaw_current_angle = 0
+        # G502 REL_X and REL_Y may arrive in adjacent evdev SYN reports.
+        # Coalesce a short display-frame worth of motion before calculating
+        # direction so a diagonal stroke is not overwritten by axis-only
+        # micro-packets. 16 ms matches a ~60 Hz stream/display frame.
+        self.motion_frame_ms = 16
+        self.motion_frame = MotionFrameAccumulator()
         self.watermark = None
 
         self.os_layer_visible = True
@@ -51,7 +62,7 @@ class G502Visualizer:
         self.menu_button_visible = True
 
         self.context_menu = Menu(self.root, tearoff=0)
-        self.context_menu.add_command(label="Edit Keys & Yew", command=self.edit_mapped_keys)
+        self.context_menu.add_command(label="Edit Keys & 2D Direction", command=self.edit_mapped_keys)
         self.context_menu.add_command(label="Change Background Color", command=self.change_background_color)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Toggle Detector Label", command=self.toggle_detector_label)
@@ -60,6 +71,11 @@ class G502Visualizer:
         self.context_menu.add_command(label="Reset Settings", command=self.reset_settings)
         self.context_menu.add_command(label="Reset Mapping", command=self.reset_mappings)
         self.context_menu.add_separator()
+        self.context_menu.add_command(label="Auto Sync Input Remapper Profile", command=self.sync_input_remapper_profile)
+        self.context_menu.add_command(label="Choose Input Remapper Profile…", command=self.choose_input_remapper_profile)
+        self.context_menu.add_command(label="Auto Mapping Report", command=self.show_input_remapper_mapping_report)
+        self.context_menu.add_command(label="Global Input Backend Report", command=self.show_input_backend_report)
+        self.context_menu.add_separator()
         self.context_menu.add_command(label="Smart Mouse Config Query", command=self.query_mouse_config)
         self.context_menu.add_command(label="Clear Visual", command=self.clear_visual)
         self.context_menu.add_command(label="Sim Keys (All)", command=self.sim_all_pressed)
@@ -67,8 +83,13 @@ class G502Visualizer:
         self.context_menu.add_separator()
         self.context_menu.add_command(label="Close", command=self.quit_app)
 
-        self.canvas.bind("<Button-3>", self.show_context_menu)
+        # Traditional Tk right-click path plus a root-level binding so the
+        # context menu works over the canvas and the rest of the visualizer.
+        self.canvas.bind("<Button-3>", self.show_context_menu, add="+")
+        self.root.bind("<Button-3>", self.show_context_menu, add="+")
         self.root.bind("<Button-1>", lambda e: self.context_menu.unpost())
+        self._last_context_post = 0.0
+        self._fallback_pointer_xy = None
 
         self.menu_btn_frame = tk.Frame(self.root, bg="#1e1e1e")
         self.menu_btn_frame.pack(fill="x", pady=5)
@@ -89,18 +110,66 @@ class G502Visualizer:
         self.detect_mode = False
         self.detect_target_var = None
 
+        # Input Remapper profile-aware action labeling. Alpha.5 additionally reads
+        # the Input-Remapper-owned raw G502 proxy devices, so physical button
+        # visualization no longer depends on which game profile is active.
+        # Existing auto/manual mappings remain as semantic/fallback layers.
+        self.auto_mapper = InputRemapperAutoMapper(on_profile_change=self.on_auto_profile_change)
+        self.auto_press_started = {}
+        self.auto_release_generation = {}
+        self.auto_min_flash_ms = 130
+        self.physical_down = set()
+
         self.load_visual_mouse()
         self.smart_detect_mouse()
-        self.start_listeners()
+        self.sync_input_remapper_profile(silent=True)
+        self.auto_mapper.start_journal_watch()
 
-        # Load settings AFTER UI is ready, then create yaw display with correct position
+        # Load settings AFTER UI is ready, then create direction display.
         self.load_settings()
         self.create_yaw_display()
 
-        # Global mouse listener for yaw
-        self.global_mouse_listener = mouse.Listener(on_move=self.global_mouse_move)
-        self.global_mouse_listener.daemon = True
-        self.global_mouse_listener.start()
+        # Wayland-safe global input. Prefer Input Remapper's virtual evdev devices
+        # so the visualizer keeps working while another application/monitor has
+        # pointer focus. pynput remains a compatibility fallback for X11 or when
+        # evdev is unavailable.
+        self.input_backend = "starting"
+        self.evdev_input = EvdevGlobalInput(
+            on_input=self.queue_input,
+            on_scroll=self.queue_scroll,
+            on_move=self.queue_relative_mouse_move,
+            on_status=self.on_input_backend_status,
+            on_button_visual=self.queue_physical_visual,
+            on_physical_scroll=self.queue_physical_scroll,
+        )
+        self.evdev_input.set_native_click_passthrough(
+            self.auto_mapper.unmapped_native_click_codes()
+        )
+        if self.evdev_input.start():
+            self.input_backend = "evdev-global"
+            if self.evdev_input.physical_mouse_ready and self.evdev_input.physical_keyboard_ready:
+                self.debug_var.set(
+                    "GLOBAL INPUT: profile-independent G502 physical telemetry ready"
+                )
+            else:
+                self.debug_var.set(
+                    "GLOBAL INPUT: evdev active — profile-independent G502 source incomplete; see Backend Report"
+                )
+        else:
+            self.input_backend = "pynput-fallback"
+            self.start_listeners()
+            self.global_mouse_listener = mouse.Listener(on_move=self.global_mouse_move)
+            self.global_mouse_listener.daemon = True
+            self.global_mouse_listener.start()
+            self.debug_var.set(
+                "INPUT FALLBACK: pynput — global evdev unavailable; see Backend Report"
+            )
+
+        # Render evdev motion at display cadence instead of posting one Tk task
+        # per mouse report. This both preserves diagonal REL_X/REL_Y pairs and
+        # prevents high-polling-rate mice from flooding Tk's event queue.
+        if self.input_backend == "evdev-global":
+            self.root.after(self.motion_frame_ms, self._flush_relative_mouse_frame)
 
         self.root.mainloop()
 
@@ -180,28 +249,39 @@ class G502Visualizer:
             self.button_mappings = self.load_mappings()
             messagebox.showinfo("Reset Complete", "Mappings have been reset to default.")
 
-    # ==================== YAW + WATERMARK ====================
-    def global_mouse_move(self, x, y):
-        if not self.yaw_visible or not self.yaw_dot_visible:
+    # ==================== 2D MOVEMENT DIRECTION + WATERMARK ====================
+    def _set_motion_direction(self, dx, dy):
+        """Place the dot on the ring using the last non-zero 2D mouse-motion vector."""
+        if not self.yaw_visible or not self.yaw_dot_visible or not (dx or dy):
             return
         try:
-            canvas_x = x - self.root.winfo_rootx()
-            canvas_y = y - self.root.winfo_rooty()
-            dx = canvas_x - self.yaw_center_x
-            dy = canvas_y - self.yaw_center_y
+            # Linux mouse REL_X/REL_Y are screen-plane deltas. Positive Y moves
+            # down on screen, which matches Tk canvas coordinates directly.
             angle = math.atan2(dy, dx)
             self.yaw_current_angle = angle
-
             dot_x = self.yaw_center_x + math.cos(angle) * self.yaw_ring_radius
             dot_y = self.yaw_center_y + math.sin(angle) * self.yaw_ring_radius
-
             self.canvas.coords(
                 self.yaw_dot,
                 dot_x - self.yaw_dot_size/2, dot_y - self.yaw_dot_size/2,
                 dot_x + self.yaw_dot_size/2, dot_y + self.yaw_dot_size/2
             )
-        except:
+        except Exception:
             pass
+
+    def global_mouse_move(self, x, y):
+        """Compatibility fallback: derive the movement vector from pointer deltas."""
+        try:
+            previous = getattr(self, "_fallback_pointer_xy", None)
+            self._fallback_pointer_xy = (x, y)
+            if previous is not None:
+                self._set_motion_direction(x - previous[0], y - previous[1])
+        except Exception:
+            pass
+
+    def global_relative_mouse_move(self, dx, dy):
+        """Update the 360-degree 2D movement direction from evdev REL_X/REL_Y."""
+        self._set_motion_direction(dx, dy)
 
     def create_yaw_display(self):
         self.canvas.delete("yaw")
@@ -223,12 +303,12 @@ class G502Visualizer:
             self.yaw_center_y + self.yaw_ring_radius,
             outline="#00ff00", width=2, tags="yaw"
         )
-
+        # Neutral startup state: no movement direction has been observed yet.
         self.yaw_dot = self.canvas.create_oval(
             self.yaw_center_x - self.yaw_dot_size/2,
-            self.yaw_center_y - self.yaw_ring_radius - self.yaw_dot_size/2,
+            self.yaw_center_y - self.yaw_dot_size/2,
             self.yaw_center_x + self.yaw_dot_size/2,
-            self.yaw_center_y - self.yaw_ring_radius + self.yaw_dot_size/2,
+            self.yaw_center_y + self.yaw_dot_size/2,
             fill="#00ff00", outline="#00ff00", tags="yaw"
         )
 
@@ -286,8 +366,39 @@ class G502Visualizer:
         path = Path(__file__).parent / "mappings.json"
         path.write_text(json.dumps(self.button_mappings, indent=2))
 
+    def _post_context_menu(self, x_root, y_root):
+        now = time.monotonic()
+        if now - getattr(self, "_last_context_post", 0.0) < 0.12:
+            return
+        self._last_context_post = now
+        try:
+            self.context_menu.post(int(x_root), int(y_root))
+        except Exception:
+            pass
+
     def show_context_menu(self, event):
-        self.context_menu.post(event.x_root, event.y_root)
+        """Traditional Tk/X11/Wayland right-click path."""
+        self._post_context_menu(event.x_root, event.y_root)
+
+    def maybe_show_context_menu_from_evdev(self):
+        """Accept Input Remapper's BTN_RIGHT while the pointer is over G502V.
+
+        The evdev backend is global, so never open the menu merely because the
+        player right-clicked in a game. We first verify that Tk reports the
+        current pointer over this application's widget tree.
+        """
+        try:
+            x, y = self.root.winfo_pointerxy()
+            widget = self.root.winfo_containing(x, y)
+            current = widget
+            while current is not None:
+                if current == self.root:
+                    self._post_context_menu(x, y)
+                    return True
+                current = getattr(current, "master", None)
+        except Exception:
+            pass
+        return False
 
     def show_menu_button(self):
         self.context_menu.post(self.root.winfo_x() + 30, self.root.winfo_y() + self.root.winfo_height() - 80)
@@ -412,24 +523,101 @@ class G502Visualizer:
                 "x": x, "y": y, "normal": normal_img, "clicked": clicked_img, "overlay_id": None
             }
 
+    def queue_physical_visual(self, visual, pressed, origin="g502-forwarding-proxy"):
+        """Marshal merged G502 control telemetry to the Tk UI thread."""
+        try:
+            self.root.after(0, lambda v=visual, p=pressed, o=origin:
+                            self.handle_physical_visual(v, p, o))
+        except Exception:
+            pass
+
+    def handle_physical_visual(self, visual, pressed, origin="g502-forwarding-proxy"):
+        """Visualize native, proxied and unmapped-passthrough main controls."""
+        if visual not in self.button_images:
+            return
+        if pressed and visual == "R1":
+            # Preserve both the classic Tk RMB menu and the globally captured
+            # physical G502 RMB path. The helper posts only while pointer is over
+            # the G502V window, so gameplay RMB does not summon the menu remotely.
+            self.maybe_show_context_menu_from_evdev()
+        if pressed:
+            self.physical_down.add(visual)
+        else:
+            self.physical_down.discard(visual)
+        state = "DOWN" if pressed else "UP"
+        self.debug_var.set(f"G502 [{origin}]: {visual} {state}")
+        self.toggle_overlay(visual, pressed)
+
+    def queue_physical_scroll(self, direction):
+        try:
+            self.root.after(0, lambda d=direction: self._handle_physical_scroll_pulse(d))
+        except Exception:
+            pass
+
+    def _handle_physical_scroll_pulse(self, direction):
+        visual = "ScrollUp" if direction == "up" else "ScrollDown"
+        self.debug_var.set(f"PHYSICAL G502: {visual}")
+        self.toggle_overlay(visual, True)
+        self.root.after(130, lambda v=visual: self.toggle_overlay(v, False))
+
+    def queue_input(self, key, pressed):
+        """Marshal background virtual-output events onto Tk's UI thread."""
+        try:
+            self.root.after(0, lambda k=key, p=pressed: self.handle_input(k, p))
+        except Exception:
+            pass
+
+    def queue_scroll(self, direction):
+        try:
+            self.root.after(0, lambda d=direction: self._handle_scroll_pulse(d))
+        except Exception:
+            pass
+
+    def _handle_scroll_pulse(self, direction):
+        key_str = f"wheel.{direction}"
+        self.handle_input(key_str, True)
+        self.root.after(130, lambda k=key_str: self.handle_input(k, False))
+
+    def queue_relative_mouse_move(self, dx, dy):
+        """Collect high-rate REL_X/REL_Y packets for one visual frame."""
+        try:
+            self.motion_frame.add(dx, dy)
+        except Exception:
+            pass
+
+    def _flush_relative_mouse_frame(self):
+        """Render one coalesced 2D movement vector and keep the last angle."""
+        try:
+            dx, dy = self.motion_frame.take()
+            if dx or dy:
+                self.global_relative_mouse_move(dx, dy)
+        finally:
+            try:
+                self.root.after(self.motion_frame_ms, self._flush_relative_mouse_frame)
+            except Exception:
+                pass
+
+    def on_input_backend_status(self, status):
+        try:
+            self.root.after(0, lambda s=status: self.debug_var.set(s))
+        except Exception:
+            pass
+
     def start_listeners(self):
         def on_press(key):
-            self.handle_input(key, True)
+            self.queue_input(key, True)
         def on_release(key):
-            self.handle_input(key, False)
+            self.queue_input(key, False)
         def on_mouse_click(x, y, button, pressed):
-            self.handle_input(button, pressed)
+            self.queue_input(button, pressed)
         def on_scroll(x, y, dx, dy):
             if dx != 0:
                 direction = "left" if dx < 0 else "right"
                 key_str = f"tilt.{direction}"
-                self.handle_input(key_str, True)
-                self.root.after(450, lambda: self.handle_input(key_str, False))
+                self.queue_input(key_str, True)
+                self.root.after(130, lambda k=key_str: self.handle_input(k, False))
             if dy != 0:
-                direction = "up" if dy > 0 else "down"
-                key_str = f"wheel.{direction}"
-                self.handle_input(key_str, True)
-                self.root.after(450, lambda: self.handle_input(key_str, False))
+                self.queue_scroll("up" if dy > 0 else "down")
 
         self.kb_listener = keyboard.Listener(on_press=on_press, on_release=on_release)
         self.kb_listener.daemon = True
@@ -485,6 +673,30 @@ class G502Visualizer:
 
         self.debug_var.set(f"Last detected: '{key_str}'   (pressed: {pressed})")
 
+        # Input Remapper can deliver BTN_RIGHT through the global evdev backend
+        # without Tk producing its traditional <Button-3> event. Accept both
+        # forms, but only post the menu when the pointer is actually over G502V.
+        if pressed and key_str == "button.right":
+            self.maybe_show_context_menu_from_evdev()
+
+        # Virtual outputs are still resolved through the active Input Remapper
+        # profile for semantic macro/action confirmation. When both raw G502 proxy
+        # interfaces are available, physical visualization is authoritative and
+        # this path deliberately does not re-toggle the same button overlays.
+        if hasattr(self, "auto_mapper"):
+            actions = self.auto_mapper.resolve(key_str)
+            resolution = "active-profile"
+            if not actions:
+                # Profile changes can race journal/autoload state. A catalog of
+                # installed Input Remapper presets provides a safe fallback when
+                # every matching profile agrees on the originating G502 control.
+                actions = self.auto_mapper.resolve_catalog_consensus(key_str)
+                resolution = "profile-consensus"
+            if actions:
+                self.handle_auto_actions(key_str, pressed, actions, resolution=resolution)
+                return
+
+        # Fallback/manual mapping path used by the original G502V implementation.
         for btn_name, combos in self.button_mappings.items():
             if btn_name not in self.button_images:
                 continue
@@ -494,6 +706,151 @@ class G502Visualizer:
                     self.debug_var.set(f"LIGHTING: {btn_name}  (key: {key_str})")
                     self.toggle_overlay(btn_name, pressed)
                     return
+
+    def on_auto_profile_change(self, profile_name):
+        """Refresh unremapped click policy when the active preset switches."""
+        try:
+            if hasattr(self, "evdev_input"):
+                self.evdev_input.set_native_click_passthrough(
+                    self.auto_mapper.unmapped_native_click_codes()
+                )
+            self.root.after(0, lambda n=profile_name: self.debug_var.set(
+                f"AUTO PROFILE: {n} — G502 actions and direct-click bridge ready"
+            ))
+        except Exception:
+            pass
+
+    def sync_input_remapper_profile(self, silent=False):
+        ok = self.auto_mapper.sync_active_profile()
+        if ok:
+            msg = (f"AUTO PROFILE: {self.auto_mapper.profile_name} — "
+                   f"{len(self.auto_mapper.actions)} macro/direct action leaves")
+            self.debug_var.set(msg)
+            if not silent:
+                messagebox.showinfo("Input Remapper Auto Map", msg)
+        else:
+            msg = ("Could not detect/load the active Input Remapper profile.\n\n"
+                   f"{self.auto_mapper.last_error}\n\n"
+                   "Manual G502V mappings remain active. You can also choose a profile JSON manually.")
+            self.debug_var.set("AUTO PROFILE: not detected — manual mappings active")
+            if not silent:
+                messagebox.showwarning("Input Remapper Auto Map", msg)
+        return ok
+
+    def choose_input_remapper_profile(self):
+        initial = self.auto_mapper.preset_dir
+        path = filedialog.askopenfilename(
+            title="Choose Input Remapper profile JSON",
+            initialdir=str(initial if initial.exists() else Path.home()),
+            filetypes=[("Input Remapper JSON", "*.json"), ("All files", "*")],
+        )
+        if not path:
+            return
+        if self.auto_mapper.load_profile_path(path):
+            self.debug_var.set(
+                f"AUTO PROFILE: {self.auto_mapper.profile_name} — manually selected"
+            )
+        else:
+            messagebox.showerror(
+                "Profile load failed",
+                f"Could not load that profile.\n\n{self.auto_mapper.last_error}",
+            )
+
+    def show_input_remapper_mapping_report(self):
+        win = Toplevel(self.root)
+        win.title("G502V — Input Remapper Auto Mapping Report")
+        win.geometry("980x720")
+        win.attributes("-topmost", True)
+        text = scrolledtext.ScrolledText(win, wrap="word", font=("TkDefaultFont", 10))
+        text.pack(fill="both", expand=True, padx=10, pady=10)
+        text.insert("1.0", self.auto_mapper.report_text())
+        text.configure(state="disabled")
+
+    def show_input_backend_report(self):
+        # Always show the evdev discovery report, even while the GUI is using
+        # pynput fallback. Alpha.3 can therefore distinguish missing devices
+        # from Linux permission/ACL problems.
+        text = self.evdev_input.report_text()
+        text += (
+            "\n\nVisualizer authority:\n"
+            "  Raw G502 proxy/hardware buttons are preferred and merged across sources.\n"
+            "  Unmapped L1/R1 can be bridged from the generic Input Remapper mouse.\n"
+            "  Active profiles determine which main clicks are truly unremapped.\n"
+            "  Other macro/action mappings remain active.\n"
+            "  Result: Desktop, Cyberpunk, Megabonk can share one G502V setup."
+        )
+        if getattr(self, "input_backend", "") != "evdev-global":
+            text += (
+                "\n\nCurrent GUI backend: pynput compatibility fallback\n"
+                "Wayland cross-window/cross-monitor capture: NOT GUARANTEED\n"
+                "Use setup_global_input_access.sh when the report lists virtual\n"
+                "Input Remapper devices as NOT READABLE."
+            )
+        win = Toplevel(self.root)
+        win.title("G502V — Global Input Backend Report")
+        win.geometry("900x560")
+        win.attributes("-topmost", True)
+        box = scrolledtext.ScrolledText(win, wrap="word", font=("TkDefaultFont", 10))
+        box.pack(fill="both", expand=True, padx=10, pady=10)
+        box.insert("1.0", text)
+        box.configure(state="disabled")
+
+    def handle_auto_actions(self, key_str, pressed, actions, resolution="active-profile"):
+        # Multiple macro leaves can intentionally share an output (for example the
+        # tap and hold forms of the same physical button). Collapse those to the
+        # unique physical controls so the visual remains deterministic.
+        visuals = []
+        for action in actions:
+            for visual in action.visuals:
+                if visual in self.button_images and visual not in visuals:
+                    visuals.append(visual)
+
+        if not visuals:
+            return
+
+        # Build a compact stream/debug label. If several gestures map to the same
+        # output from the same control, show all recognized gesture classes.
+        sources = []
+        gestures = []
+        for action in actions:
+            if action.visual_label not in sources:
+                sources.append(action.visual_label)
+            g = action.gesture.upper()
+            if g not in gestures:
+                gestures.append(g)
+        source_text = " / ".join(sources)
+        gesture_text = "/".join(gestures)
+        tag = "ACTION CONFIRM" if resolution == "active-profile" else "PROFILE-CONSENSUS"
+        self.debug_var.set(f"{tag}: {source_text} • {gesture_text} → {key_str}")
+
+        now = time.monotonic()
+        for visual in visuals:
+            # If the raw G502 proxy is currently reporting this control as
+            # physically down, do not let delayed/pulsed virtual output fight the
+            # physical overlay. If the proxy does not expose this mapped control,
+            # the profile-driven path remains the fallback exactly as before.
+            if visual in self.physical_down:
+                continue
+            if pressed:
+                generation = self.auto_release_generation.get(visual, 0) + 1
+                self.auto_release_generation[visual] = generation
+                self.auto_press_started[visual] = now
+                self.toggle_overlay(visual, True)
+            else:
+                generation = self.auto_release_generation.get(visual, 0)
+                started = self.auto_press_started.get(visual, now)
+                elapsed_ms = max(0.0, (now - started) * 1000.0)
+                delay = max(0, int(self.auto_min_flash_ms - elapsed_ms))
+
+                def release(v=visual, g=generation):
+                    if self.auto_release_generation.get(v, 0) == g and v not in self.physical_down:
+                        self.toggle_overlay(v, False)
+                        self.auto_press_started.pop(v, None)
+
+                if delay:
+                    self.root.after(delay, release)
+                else:
+                    release()
 
     def toggle_overlay(self, btn_name, show):
         data = self.button_images.get(btn_name)
@@ -508,23 +865,48 @@ class G502Visualizer:
             )
 
     def smart_detect_mouse(self):
-        self.debug_var.set("Detecting G502 onboard memory...")
+        # This onboard-memory query is optional and independent of the live
+        # Input Remapper telemetry backend. libratbag often exposes a codename
+        # rather than the model name, so the global backend probes candidate info too.
+        self.ratbag_status = "not checked"
+        self.debug_var.set("Detecting optional G502 onboard-memory interface...")
         out, err, code = run_command("ratbagctl list")
         if code != 0 or not out:
-            self.debug_var.set("Ready (ratbagctl not found but functional)")
+            self.ratbag_status = f"ratbagctl unavailable/no devices: {err or 'no output'}"
+            self.debug_var.set("Ready (onboard-memory query unavailable; telemetry can still work)")
             return
+        candidates = []
         for line in out.splitlines():
-            if "G502" in line or "thundering" in line.lower():
-                self.device_name = line.split(":", 1)[0].strip()
+            if ":" not in line:
+                continue
+            rid = line.split(":", 1)[0].strip()
+            candidates.append((rid, line))
+            if "g502" in line.lower():
+                self.device_name = rid
                 break
+        if not self.device_name:
+            for rid, line in candidates:
+                info, _, rc = run_command(f'ratbagctl "{rid}" info')
+                if rc == 0 and "g502" in info.lower():
+                    self.device_name = rid
+                    break
         if self.device_name:
             out2, _, _ = run_command(f'ratbagctl "{self.device_name}" profile active get')
             self.active_profile = out2.strip() if out2 else "0"
+            self.ratbag_status = f"detected: {self.device_name}"
             self.debug_var.set(f"✅ {self.device_name} | Active Profile: {self.active_profile}")
+        else:
+            self.ratbag_status = "ratbagctl saw devices, but none identified as a G502"
+            self.debug_var.set("Ready (G502 onboard-memory query unavailable; telemetry can still work)")
 
     def query_mouse_config(self):
         if not self.device_name:
-            messagebox.showwarning("No device", "G502 not detected")
+            messagebox.showwarning(
+                "Onboard query unavailable",
+                "libratbag did not identify a G502 for the optional onboard-memory query.\n\n"
+                f"{getattr(self, 'ratbag_status', 'No ratbag status')}\n\n"
+                "This does NOT prevent Input Remapper auto-mapping or global evdev telemetry."
+            )
             return
         win = Toplevel(self.root)
         win.title("G502 Onboard Memory - Full Smart Query")
@@ -580,8 +962,8 @@ class G502Visualizer:
             Button(row, text="Detect", width=6, command=lambda v1=var1, v2=var2, e=editor: self.start_detect_for_row(v1, v2, e)).pack(side="left", padx=1)
             Button(row, text="Show", width=5, command=lambda b=btn_name: self.show_button_temporary(b)).pack(side="left", padx=1)
 
-        # YEW ICON SECTION
-        yew_frame = tk.LabelFrame(editor, text="Yew & Icon", font=("TkDefaultFont", 11, "bold"))
+        # DIRECTION INDICATOR SECTION
+        yew_frame = tk.LabelFrame(editor, text="2D Movement Direction & Icon", font=("TkDefaultFont", 11, "bold"))
         yew_frame.pack(fill="x", padx=15, pady=10)
 
         row1 = tk.Frame(yew_frame)
@@ -730,6 +1112,8 @@ class G502Visualizer:
 
     def quit_app(self):
         self.clear_visual()
+        if hasattr(self, "auto_mapper"): self.auto_mapper.stop()
+        if hasattr(self, "evdev_input"): self.evdev_input.stop()
         if hasattr(self, "kb_listener"): self.kb_listener.stop()
         if hasattr(self, "mouse_listener"): self.mouse_listener.stop()
         if hasattr(self, "global_mouse_listener"): self.global_mouse_listener.stop()
