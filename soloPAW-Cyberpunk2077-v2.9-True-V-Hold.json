@@ -1,0 +1,112 @@
+[
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 47
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "set(soloPAW_shift,1).hold().set(soloPAW_shift,0)"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 17
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "if_eq($soloPAW_shift,1,if_tap(if_tap(key_down(e).wait(1930).key_up(e),key(r),300),hold_keys(r),300),hold_keys(j))"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 33
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "if_eq($soloPAW_shift,1,if_tap(if_tap(key_down(z).wait(1930).key_up(z),key(c),300),hold_keys(c),300),if_tap(key(space),hold_keys(KEY_SLASH),300))"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 57
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "if_eq($soloPAW_shift,1,if_tap(if_tap(key(3),key(h),225),hold_keys(o),550),if_tap(if_tap(key(1),key(Control_L),225),hold_keys(b),550))"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 1
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "if_eq($soloPAW_shift,1,key(l),hold_keys(f))"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 30
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "if_eq($soloPAW_shift,1,if_tap(key(q),hold_keys(v),450),hold_keys(a))"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 32
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "if_eq($soloPAW_shift,1,key(Escape),hold_keys(d))"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 31
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "if_tap(if_tap(key_down(Shift_R).wait(120).key_up(Shift_R),key(s),300),hold_keys(s),300)"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 16
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "if_eq($soloPAW_shift,1,if_tap(if_tap(key(k),key(KEY_LEFTBRACE),300),key(w),650),if_tap(if_tap(key(m),key(t),300),hold_keys(t),650))"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 272
+            }
+        ],
+        "target_uinput": "keyboard + mouse",
+        "output_symbol": "if_eq($soloPAW_shift,1,hold_keys(x),hold_keys(BTN_LEFT))"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 273
+            }
+        ],
+        "target_uinput": "keyboard + mouse",
+        "output_symbol": "if_eq($soloPAW_shift,1,if_tap(if_tap(key(n),key(BTN_MIDDLE),300),hold_keys(BTN_MIDDLE),650),hold_keys(BTN_RIGHT))"
+    }
+]

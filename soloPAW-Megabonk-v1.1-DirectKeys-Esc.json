@@ -1,0 +1,137 @@
+[
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 47
+            },
+            {
+                "type": 1,
+                "code": 32
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "Escape",
+        "release_combination_keys": true
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 47
+            },
+            {
+                "type": 1,
+                "code": 17
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "m",
+        "release_combination_keys": true
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 47
+            },
+            {
+                "type": 1,
+                "code": 1
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "q",
+        "release_combination_keys": true
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 31
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "s"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 17
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "w"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 47
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "disable"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 33
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "space"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 57
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "Control_L"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 1
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "f"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 30
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "a"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 32
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "d"
+    },
+    {
+        "input_combination": [
+            {
+                "type": 1,
+                "code": 16
+            }
+        ],
+        "target_uinput": "keyboard",
+        "output_symbol": "t"
+    }
+]
